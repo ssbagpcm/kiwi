@@ -427,7 +427,7 @@ func (s *sessionServer) ensureShell(handshake sessionHandshake) error {
 	shells := sessionShellCandidates(config.Shell)
 	var ptmx *os.File
 	var cmd *exec.Cmd
-	var shellErr error
+	shellErr := fmt.Errorf("no shell found in container (tried %v)", shells)
 	rootPath := runtimeRootfsPath(state)
 	if rootPath == "" {
 		return fmt.Errorf("container %q has no live rootfs", config.Name)
@@ -438,7 +438,7 @@ func (s *sessionServer) ensureShell(handshake sessionHandshake) error {
 			shellPath = "/" + shellPath
 		}
 		fullPath := filepath.Join(rootPath, strings.TrimPrefix(shellPath, "/"))
-		if _, err := os.Stat(fullPath); err != nil {
+		if _, err := os.Lstat(fullPath); err != nil {
 			continue
 		}
 		args := []string{"-t", strconv.Itoa(state.PID), "-m", "-u", "-i", "-n", "-p", "--", shellPath, "-i"}
@@ -455,8 +455,11 @@ func (s *sessionServer) ensureShell(handshake sessionHandshake) error {
 			break
 		}
 	}
-	if shellErr != nil {
-		return fmt.Errorf("no shell found in container (tried %v): %w", shells, shellErr)
+	if shellErr != nil || cmd == nil || cmd.Process == nil {
+		if shellErr == nil {
+			shellErr = fmt.Errorf("failed to start shell")
+		}
+		return shellErr
 	}
 	s.ptyFile = ptmx
 	s.shellCmd = cmd

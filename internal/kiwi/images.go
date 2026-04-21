@@ -7,17 +7,17 @@ import (
 	"time"
 )
 
-const imagePreparedBy = "kiwi-v5-dir"
+const imagePreparedBy = "kiwi-v7-dir"
 
 var builtInImages = map[string]builtInImage{
 	"alpine": {
 		Name:        "alpine",
-		URL:         "https://fra1lxdmirror01.do.letsbuildthe.cloud/images/alpine/3.23/amd64/cloud/20260420_13:00/rootfs.squashfs",
+		URL:         "https://fra1lxdmirror01.do.letsbuildthe.cloud/images/alpine/3.23/amd64/cloud/20260420_13:00/rootfs.tar.xz",
 		Description: "Alpine 3.23 cloud rootfs",
 	},
 	"debian": {
 		Name:        "debian",
-		URL:         "https://fra1lxdmirror01.do.letsbuildthe.cloud/images/debian/trixie/amd64/default/20260420_05:24/rootfs.squashfs",
+		URL:         "https://fra1lxdmirror01.do.letsbuildthe.cloud/images/debian/trixie/amd64/default/20260420_05:24/rootfs.tar.xz",
 		Description: "Debian trixie cloud rootfs",
 	},
 }
@@ -52,10 +52,11 @@ func (s Store) PullBuiltInImage(name string) (ImageManifest, string, error) {
 	if err := os.MkdirAll(s.ImageDir(image.Name), 0755); err != nil {
 		return ImageManifest{}, "", err
 	}
-	downloadPath := filepath.Join(s.ImageDir(image.Name), "rootfs.squashfs")
+	downloadPath := filepath.Join(s.ImageDir(image.Name), "rootfs.tar.xz")
 	if err := downloadFile(image.URL, downloadPath); err != nil {
 		return ImageManifest{}, "", err
 	}
+
 	rootfsPath := s.ImageRootfsPath(image.Name)
 	if err := os.RemoveAll(rootfsPath); err != nil && !os.IsNotExist(err) {
 		return ImageManifest{}, "", err
@@ -63,21 +64,13 @@ func (s Store) PullBuiltInImage(name string) (ImageManifest, string, error) {
 	if err := os.MkdirAll(rootfsPath, 0755); err != nil {
 		return ImageManifest{}, "", err
 	}
-	mountDir, err := os.MkdirTemp("", "kiwi-image-")
-	if err != nil {
-		return ImageManifest{}, "", err
-	}
-	defer os.RemoveAll(mountDir)
-	if err := runCommand("mount", "-t", "squashfs", "-o", "loop,ro", downloadPath, mountDir); err != nil {
-		return ImageManifest{}, "", fmt.Errorf("%w\n\nTip: loop devices are not available on this host.\nRun: sudo modprobe loop", err)
-	}
-	defer func() {
-		_ = runCommand("umount", "-l", mountDir)
-	}()
-	if err := copyPath(filepath.Join(mountDir, "."), rootfsPath); err != nil {
+
+	// Extract immediately using native tar, removing the need for loop mounts later
+	if err := runCommand("tar", "-xpf", downloadPath, "-C", rootfsPath); err != nil {
 		return ImageManifest{}, "", err
 	}
 	_ = os.Remove(downloadPath)
+
 	manifest := ImageManifest{
 		Name:        image.Name,
 		RootfsPath:  rootfsPath,
@@ -90,8 +83,6 @@ func (s Store) PullBuiltInImage(name string) (ImageManifest, string, error) {
 	if err := s.SaveImage(manifest); err != nil {
 		return ImageManifest{}, "", err
 	}
-	// Don't create archive here - only create when explicitly exporting
-	// This makes pull much faster by skipping re-reading all rootfs files
 	maybeChownPaths(s.ImageDir(image.Name), s.ImageManifestPath(manifest.Name))
 	return manifest, "", nil
 }
@@ -217,50 +208,65 @@ func (s Store) SaveImageArchive(manifest ImageManifest, destination string) erro
 	return s.saveArchive(archiveEnvelope{Kind: "image", ImageName: manifest.Name}, manifest, nil, destination)
 }
 
-func (s Store) ensureImageDirectoryBackend(name string) (ImageManifest, error) {
+func (s Store) ensureImageBackend(name string) (ImageManifest, error) {
 	manifest, err := s.LoadImage(name)
 	if err != nil {
 		return ImageManifest{}, err
 	}
-	targetRootfs := s.ImageRootfsPath(manifest.Name)
-	if manifest.Format == "dir" && manifest.RootfsPath == targetRootfs && isDirectoryPath(targetRootfs) {
+	if manifest.Format == "dir" && isDirectoryPath(manifest.RootfsPath) {
 		return manifest, nil
 	}
-	if isDirectoryPath(targetRootfs) && manifest.RootfsPath != targetRootfs {
+	if manifest.Format == "squashfs" && pathExists(manifest.RootfsPath) {
+		// Optimization: if we are on a host where loop is disabled, we MUST extract to dir format
+		// to keep subsequent operations fast. We only do this ONCE.
+		tempDir, err := os.MkdirTemp("", "kiwi-mount-test-")
+		if err == nil {
+			err = runCommand("mount", "-t", "squashfs", "-o", "loop,ro", manifest.RootfsPath, tempDir)
+			if err == nil {
+				_ = runCommand("umount", "-l", tempDir)
+				_ = os.RemoveAll(tempDir)
+				return manifest, nil
+			}
+			_ = os.RemoveAll(tempDir)
+			if isLoopMountError(err) {
+				// Loop not available, extract to directory for permanent backend
+				targetRootfs := s.ImageRootfsPath(manifest.Name)
+				_ = os.RemoveAll(targetRootfs)
+				_ = os.MkdirAll(targetRootfs, 0755)
+				// Try unsquashfs
+				if err := runCommand("unsquashfs", "-f", "-d", targetRootfs, manifest.RootfsPath); err == nil {
+					manifest.RootfsPath = targetRootfs
+					manifest.Format = "dir"
+					manifest.PreparedBy = imagePreparedBy
+					_ = s.SaveImage(manifest)
+					return manifest, nil
+				}
+				// If unsquashfs is not available, we must RE-PULL as tar.xz
+				if _, ok := builtInImages[manifest.Name]; ok {
+					newManifest, _, err := s.PullBuiltInImage(manifest.Name)
+					if err == nil {
+						return newManifest, nil
+					}
+				}
+			}
+		}
+		return manifest, nil
+	}
+	// Migration/check for existing data
+	targetRootfs := s.ImageRootfsPath(manifest.Name)
+	if isDirectoryPath(targetRootfs) {
 		manifest.RootfsPath = targetRootfs
 		manifest.Format = "dir"
 		manifest.PreparedBy = imagePreparedBy
-		if err := s.SaveImage(manifest); err != nil {
-			return ImageManifest{}, err
-		}
+		_ = s.SaveImage(manifest)
 		return manifest, nil
 	}
-	if isDirectoryPath(manifest.RootfsPath) {
-		if err := copyPath(filepath.Join(manifest.RootfsPath, "."), targetRootfs); err != nil {
-			return ImageManifest{}, err
-		}
-	} else {
-		mountDir, err := os.MkdirTemp("", "kiwi-image-migrate-")
-		if err != nil {
-			return ImageManifest{}, err
-		}
-		defer os.RemoveAll(mountDir)
-		if err := runCommand("mount", "-t", "squashfs", "-o", "loop,ro", manifest.RootfsPath, mountDir); err != nil {
-			return ImageManifest{}, fmt.Errorf("%w\n\nTip: loop devices are not available on this host.\nRun: sudo modprobe loop", err)
-		}
-		defer func() {
-			_ = runCommand("umount", "-l", mountDir)
-		}()
-		if err := copyPath(filepath.Join(mountDir, "."), targetRootfs); err != nil {
-			return ImageManifest{}, err
-		}
+	squashPath := targetRootfs + ".squashfs"
+	if pathExists(squashPath) {
+		manifest.RootfsPath = squashPath
+		manifest.Format = "squashfs"
+		_ = s.SaveImage(manifest)
+		return s.ensureImageBackend(manifest.Name)
 	}
-	manifest.RootfsPath = targetRootfs
-	manifest.Format = "dir"
-	manifest.PreparedBy = imagePreparedBy
-	if err := s.SaveImage(manifest); err != nil {
-		return ImageManifest{}, err
-	}
-	maybeChownPaths(s.ImageDir(manifest.Name), s.ImageManifestPath(manifest.Name))
 	return manifest, nil
 }

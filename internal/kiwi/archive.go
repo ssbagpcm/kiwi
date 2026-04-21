@@ -274,8 +274,11 @@ func (s Store) importArchiveImage(data archiveData, imageName string) (ImageMani
 	if err := os.MkdirAll(s.ImageDir(manifest.Name), 0755); err != nil {
 		return ImageManifest{}, err
 	}
-	if err := copyPath(data.Manifest.RootfsPath, manifest.RootfsPath); err != nil {
-		return ImageManifest{}, err
+	// Try instant rename first, fallback to copy if on different filesystem
+	if err := os.Rename(data.Manifest.RootfsPath, manifest.RootfsPath); err != nil {
+		if err := copyPath(data.Manifest.RootfsPath, manifest.RootfsPath); err != nil {
+			return ImageManifest{}, err
+		}
 	}
 	if err := s.SaveImage(manifest); err != nil {
 		return ImageManifest{}, err

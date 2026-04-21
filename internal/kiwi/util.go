@@ -566,7 +566,11 @@ func isLoopMountError(err error) bool {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "loop device") || strings.Contains(message, "failed to setup loop device") || strings.Contains(message, "operation not permitted")
+	return strings.Contains(message, "loop") ||
+		strings.Contains(message, "exit status 32") ||
+		strings.Contains(message, "wrong fs type") ||
+		strings.Contains(message, "bad superblock") ||
+		strings.Contains(message, "operation not permitted")
 }
 
 func maybeChownPath(path string) {

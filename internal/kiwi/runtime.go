@@ -27,7 +27,7 @@ func (s Store) NewContainer(imageName, containerName string, sizeBytes int64) (C
 		}
 		containerName = generatedName
 	}
-	if _, err := s.ensureImageDirectoryBackend(imageName); err != nil {
+	if _, err := s.ensureImageBackend(imageName); err != nil {
 		return ContainerConfig{}, err
 	}
 	if _, err := os.Stat(s.ContainerConfigPath(containerName)); err == nil {
@@ -105,7 +105,7 @@ func (s Store) NextContainerName() (string, error) {
 }
 
 func (s Store) UpdateContainerResources(name string, options StartOptions) (ContainerConfig, error) {
-	config, _, err := s.ensureContainerDirectoryBackend(name)
+	config, _, err := s.ensureContainerBackend(name)
 	if err != nil {
 		return ContainerConfig{}, err
 	}
@@ -178,7 +178,7 @@ func (s Store) UpdateContainerResources(name string, options StartOptions) (Cont
 }
 
 func (s Store) ensureMounted(name, target string) (RuntimeState, bool, error) {
-	config, image, err := s.ensureContainerDirectoryBackend(name)
+	config, image, err := s.ensureContainerBackend(name)
 	if err != nil {
 		return RuntimeState{}, false, err
 	}
@@ -255,7 +255,7 @@ func (s Store) ensureMounted(name, target string) (RuntimeState, bool, error) {
 }
 
 func (s Store) MountContainer(name, target string) (RuntimeState, error) {
-	config, image, err := s.ensureContainerDirectoryBackend(name)
+	config, image, err := s.ensureContainerBackend(name)
 	if err != nil {
 		return RuntimeState{}, err
 	}
@@ -325,7 +325,7 @@ func (s Store) UnmountContainer(name string) error {
 }
 
 func (s Store) SnapshotContainer(name, snapshot string) (string, error) {
-	config, manifest, err := s.ensureContainerDirectoryBackend(name)
+	config, manifest, err := s.ensureContainerBackend(name)
 	if err != nil {
 		return "", err
 	}
@@ -344,7 +344,7 @@ func (s Store) SnapshotContainer(name, snapshot string) (string, error) {
 }
 
 func (s Store) StartContainer(name string, options StartOptions) (RuntimeState, error) {
-	config, image, err := s.ensureContainerDirectoryBackend(name)
+	config, image, err := s.ensureContainerBackend(name)
 	if err != nil {
 		return RuntimeState{}, err
 	}
@@ -1363,10 +1363,9 @@ func prepareOverlayDirs(image ImageManifest, config ContainerConfig, baseDir, st
 			}
 		}
 		lowerDir = baseDir
-		cleanup = func() {
-			_ = runCommand("umount", "-l", baseDir)
-		}
+		cleanup = func() { _ = unmountPath(baseDir) }
 	}
+
 
 	stateRoot := config.StatePath
 	stateCleanup := func() {}
@@ -1508,12 +1507,12 @@ func watchContainerStorageLimit(config ContainerConfig, pid int) {
 	}()
 }
 
-func (s Store) ensureContainerDirectoryBackend(name string) (ContainerConfig, ImageManifest, error) {
+func (s Store) ensureContainerBackend(name string) (ContainerConfig, ImageManifest, error) {
 	config, err := s.LoadContainer(name)
 	if err != nil {
 		return ContainerConfig{}, ImageManifest{}, err
 	}
-	image, err := s.ensureImageDirectoryBackend(config.Image)
+	image, err := s.ensureImageBackend(config.Image)
 	if err != nil {
 		return ContainerConfig{}, ImageManifest{}, err
 	}
@@ -1529,6 +1528,27 @@ func (s Store) ensureContainerDirectoryBackend(name string) (ContainerConfig, Im
 		}
 		return config, image, nil
 	}
+
+	// Loop check for state
+	if !isDirectoryPath(config.StatePath) {
+		tempDir, err := os.MkdirTemp("", "kiwi-mount-test-")
+		if err == nil {
+			err = runCommand("mount", "-t", "ext4", "-o", "loop,rw", config.StatePath, tempDir)
+			if err == nil {
+				_ = runCommand("umount", "-l", tempDir)
+				_ = os.RemoveAll(tempDir)
+				return config, image, nil
+			}
+			_ = os.RemoveAll(tempDir)
+			if !isLoopMountError(err) {
+				return config, image, nil
+			}
+			// Migration needed because loop is disabled
+		}
+	} else if config.StateBackend == "dir" {
+		return config, image, nil
+	}
+
 	workspace, err := os.MkdirTemp("", "kiwi-state-migrate-")
 	if err != nil {
 		return ContainerConfig{}, ImageManifest{}, err
