@@ -1,0 +1,24 @@
+<config>
+ram=1GB
+storage=2GB
+cpu=2
+network=host
+</config>
+
+FROM debian
+
+RUN apt update && apt install -y \
+    vim \
+    git \
+    curl \
+    wget \
+    htop \
+    fastfetch
+
+RUN useradd -m -s /bin/bash developer
+
+/* multiline command example
+   this is useful for long scripts */
+echo "export PATH=\$PATH:/opt/bin" >> /home/developer/.bashrc
+
+RUN mkdir -p /workspace
