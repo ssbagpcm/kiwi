@@ -132,6 +132,20 @@ func displayNetwork(value string) string {
 	return mode
 }
 
+// displayStorage formats a ContainerConfig's storage cap for the `list`
+// command. "host" means the container uses the host FS with no soft
+// watcher — useful for one-off debug containers. Otherwise we print the
+// cap in IEC units to match --storage input (1G, 5G…).
+func displayStorage(config ContainerConfig) string {
+	if config.StateSizeHost {
+		return "host"
+	}
+	if config.StateSizeBytes <= 0 {
+		return formatBytesIEC(defaultStateSize)
+	}
+	return formatBytesIEC(config.StateSizeBytes)
+}
+
 func normalizeNetworkMode(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", defaultNetwork, "private", "isolated":
@@ -312,6 +326,99 @@ func mountOverlayPath(lower, upper, work, target string) error {
 	)
 }
 
+// extractSquashfs expands a squashfs image into target using unsquashfs so
+// kiwi works on hosts without loop-device support (Codespaces, unprivileged
+// containers, CI runners).
+func extractSquashfs(squashfsPath, target string) error {
+	if err := ensureDir(target); err != nil {
+		return err
+	}
+	if _, err := exec.LookPath("unsquashfs"); err != nil {
+		return fmt.Errorf("unsquashfs not found on PATH: install `squashfs-tools` (apt install squashfs-tools)")
+	}
+	return runCommand("unsquashfs", "-f", "-d", target, squashfsPath)
+}
+
+const squashfsMagic = "hsqs"
+const gzipMagicByte0 = 0x1f
+const gzipMagicByte1 = 0x8b
+
+// isSquashfsFile tests a file's first bytes for the squashfs 4.x magic
+// ("hsqs" in little-endian). Lets us detect the `.kiwi` format (squashfs vs
+// legacy tar.gz) in constant time, without extracting anything.
+func isSquashfsFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return false
+	}
+	return string(buf) == squashfsMagic
+}
+
+// isGzipFile tests for gzip magic bytes.
+func isGzipFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return false
+	}
+	return buf[0] == gzipMagicByte0 && buf[1] == gzipMagicByte1
+}
+
+// mountSquashfsReadOnly mounts a squashfs image read-only at target. Prefers
+// squashfuse (works unprivileged, no loop device) when available, otherwise
+// falls back to the kernel driver with a loop mount. Both operations are
+// instant — data is paged in on demand, no extraction required.
+func mountSquashfsReadOnly(squashfsPath, target string) error {
+	if err := ensureDir(target); err != nil {
+		return err
+	}
+	if _, err := exec.LookPath("squashfuse"); err == nil {
+		if err := runCommand("squashfuse", squashfsPath, target); err == nil {
+			return nil
+		}
+	}
+	return runCommand("mount", "-t", "squashfs", "-o", "loop,ro", squashfsPath, target)
+}
+
+// packSquashfs builds a squashfs image at destination from the given source
+// directory, using zstd level 3 for a high compression ratio at very fast
+// decompression speed (≈5× faster than gzip, similar ratio). The resulting
+// file is a ready-to-mount kernel image: no extraction needed at runtime.
+func packSquashfs(sourceDir, destination string) error {
+	if _, err := exec.LookPath("mksquashfs"); err != nil {
+		return fmt.Errorf("mksquashfs not found: install `squashfs-tools` (apt install squashfs-tools)")
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
+		return err
+	}
+	if pathExists(destination) {
+		if err := os.Remove(destination); err != nil {
+			return err
+		}
+	}
+	// LZ4 (high-compression mode) gives us ~4 GB/s decompression throughput
+	// — roughly 3× faster than zstd — at the cost of ~20% larger output.
+	// That matters here because every first-read of a file in the container
+	// decompresses on-demand; LZ4 makes those reads effectively free.
+	args := []string{
+		sourceDir, destination,
+		"-comp", "lz4", "-Xhc",
+		"-no-progress",
+		"-noappend",
+		"-xattrs", // preserve overlayfs whiteouts (trusted.overlay.*)
+	}
+	return runCommand("mksquashfs", args...)
+}
+
 func writeFileString(path, value string) error {
 	return os.WriteFile(path, []byte(value), 0644)
 }
@@ -340,6 +447,27 @@ func copyPath(src, dst string) error {
 		return fmt.Errorf("copy directory %s -> %s failed", src, dst)
 	}
 	return copyFile(src, dst)
+}
+
+// hardlinkTreePath mirrors src to dst using hardlinks for regular files, so
+// the operation is O(inode count) instead of O(bytes). Safe when the consumer
+// will only *read* dst or layer it through overlayfs (overlayfs always writes
+// to a separate upperdir). Falls back to a full copy if hardlinks cannot be
+// created (cross-device, unsupported FS).
+func hardlinkTreePath(src, dst string) error {
+	if err := os.RemoveAll(dst); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	if err := runCommand("cp", "-al", src, dst); err == nil {
+		return nil
+	}
+	if err := runCommand("cp", "--reflink=auto", "-a", src, dst); err == nil {
+		return nil
+	}
+	return fmt.Errorf("mirror directory %s -> %s failed", src, dst)
 }
 
 func copyFile(src, dst string) error {
@@ -566,11 +694,7 @@ func isLoopMountError(err error) bool {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "loop") ||
-		strings.Contains(message, "exit status 32") ||
-		strings.Contains(message, "wrong fs type") ||
-		strings.Contains(message, "bad superblock") ||
-		strings.Contains(message, "operation not permitted")
+	return strings.Contains(message, "loop device") || strings.Contains(message, "failed to setup loop device") || strings.Contains(message, "operation not permitted")
 }
 
 func maybeChownPath(path string) {

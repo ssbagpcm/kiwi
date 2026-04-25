@@ -71,7 +71,7 @@ Built-in test images:
 ./kiwi list [containers|images|all]
 ./kiwi pull <alpine|debian>
 ./kiwi import --name <image> /path/rootfs.tar.xz
-./kiwi create <image|file.kiwi> [--size 1G]
+./kiwi create <image|file.kiwi> [--storage 1G]
 ./kiwi set <name> [--memory 256M|host] [--cpu 1|host] [--storage 2G|host] [--network host|separate] [--shell /bin/bash]
 ./kiwi sessions <name> [--kill <session>] [--delete <session>]
 ./kiwi stop <name>

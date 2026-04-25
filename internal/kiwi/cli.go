@@ -60,6 +60,8 @@ func Main(args []string) error {
 		return handleKillAll(store, args[1:])
 	case "force-cleanup":
 		return handleForceCleanup(store, args[1:])
+	case "purge":
+		return handlePurge(store, args[1:])
 	case "snap":
 		return handleSnapshot(store, args[1:])
 	case "build":
@@ -183,7 +185,7 @@ func handleList(store Store, args []string) error {
 					mountTarget = " mount=" + filepath.Clean(state.TargetMountpoint)
 				}
 			}
-			fmt.Printf("%s %s image=%s memory=%s cpu=%s network=%s%s\n", container.Name, status, container.Image, displayMemory(container.Memory), displayCPU(container.CPU, container.CPUHost), displayNetwork(container.Network), mountTarget)
+			fmt.Printf("%s %s image=%s memory=%s cpu=%s storage=%s network=%s%s\n", container.Name, status, container.Image, displayMemory(container.Memory), displayCPU(container.CPU, container.CPUHost), displayStorage(container), displayNetwork(container.Network), mountTarget)
 		}
 	}
 	return nil
@@ -409,6 +411,33 @@ func handleKillAll(store Store, args []string) error {
 	return nil
 }
 
+func handlePurge(store Store, args []string) error {
+	skipConfirm := false
+	if len(args) == 1 && (args[0] == "--yes" || args[0] == "-y") {
+		skipConfirm = true
+	} else if len(args) != 0 {
+		return fmt.Errorf("usage: ./kiwi purge [--yes]")
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("purge requires root; run with sudo")
+	}
+	if !skipConfirm {
+		fmt.Printf("this will stop every kiwi container, unmount everything, and DELETE\n  %s\n  %s\n", store.DataRoot, store.RuntimeRoot)
+		confirmed, err := confirmDelete("kiwi data")
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			return fmt.Errorf("purge canceled")
+		}
+	}
+	if err := store.PurgeEverything(); err != nil {
+		return err
+	}
+	fmt.Println("purged")
+	return nil
+}
+
 func handleForceCleanup(store Store, args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("usage: ./kiwi force-cleanup")
@@ -451,13 +480,20 @@ func handleEnter(args []string) error {
 	root := fs.String("root", "", "runtime root")
 	image := fs.String("image", "", "base squashfs path")
 	state := fs.String("state", "", "state image path")
+	archive := fs.String("archive", "", "snapshot archive path")
+	// --cgroup and --storage-limit are accepted (but ignored) for
+	// backwards compatibility with older config.json files that may
+	// have lingering references. The values aren't needed now that
+	// spoofing is removed.
+	_ = fs.String("cgroup", "", "deprecated: container cgroup path")
+	_ = fs.Int64("storage-limit", 0, "deprecated: storage cap bytes")
 	name := fs.String("name", "", "container hostname")
 	ipv4 := fs.String("ipv4", "", "container ipv4")
 	syncFD := fs.Int("sync-fd", 0, "startup sync fd")
 	if err := fs.Parse(before); err != nil {
 		return err
 	}
-	return EnterContainer(*root, *image, *state, *name, *ipv4, *syncFD, command)
+	return EnterContainer(*root, *image, *state, *archive, *name, *ipv4, *syncFD, command)
 }
 
 func handleSessionDaemon(args []string) error {
@@ -499,7 +535,7 @@ func usageText() string {
   ./kiwi list [containers|images|all]
   ./kiwi pull <image> [image ...]
   ./kiwi import --name <image> /path/rootfs.tar.xz
-  ./kiwi create <image|file.kiwi> [--size 1G]
+  ./kiwi create <image|file.kiwi> [--storage 1G]
   ./kiwi set <id> [--memory 256M|host] [--cpu 1|host] [--storage 2G|host] [--network host|separate] [--shell /bin/bash]
   sudo ./kiwi attach <id> [-- command args]
   sudo ./kiwi attach --direct <id> [-- command args]
@@ -514,6 +550,7 @@ func usageText() string {
   ./kiwi cleanup
   ./kiwi killall [--yes]
   ./kiwi force-cleanup
+  ./kiwi purge [--yes]
   ./kiwi snap <id> <name>
   ./kiwi commit <container> <image>
   ./kiwi terminal`)
@@ -528,18 +565,19 @@ type createArgs struct {
 func parseCreateArgs(args []string) (createArgs, error) {
 	before, _ := splitArgsOnDoubleDash(args)
 	parsed := createArgs{}
+	usage := "usage: ./kiwi create <image|file.kiwi> [--storage 1G]"
 	for index := 0; index < len(before); index++ {
 		arg := before[index]
 		switch {
-		case arg == "--size":
+		case arg == "--storage":
 			index++
 			if index >= len(before) {
-				return createArgs{}, fmt.Errorf("usage: ./kiwi create <image|file.kiwi> [--size 1G]")
+				return createArgs{}, fmt.Errorf("%s", usage)
 			}
 			parsed.Size = before[index]
 			parsed.HasSize = true
-		case strings.HasPrefix(arg, "--size="):
-			parsed.Size = strings.TrimPrefix(arg, "--size=")
+		case strings.HasPrefix(arg, "--storage="):
+			parsed.Size = strings.TrimPrefix(arg, "--storage=")
 			parsed.HasSize = true
 		case strings.HasPrefix(arg, "-"):
 			return createArgs{}, fmt.Errorf("unknown create flag %q", arg)
@@ -547,12 +585,12 @@ func parseCreateArgs(args []string) (createArgs, error) {
 			if parsed.Source == "" {
 				parsed.Source = arg
 			} else {
-				return createArgs{}, fmt.Errorf("usage: ./kiwi create <image|file.kiwi> [--size 1G]")
+				return createArgs{}, fmt.Errorf("%s", usage)
 			}
 		}
 	}
 	if parsed.Source == "" {
-		return createArgs{}, fmt.Errorf("usage: ./kiwi create <image|file.kiwi> [--size 1G]")
+		return createArgs{}, fmt.Errorf("%s", usage)
 	}
 	return parsed, nil
 }

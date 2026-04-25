@@ -2,6 +2,7 @@ package kiwi
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 )
 
+
 type archiveData struct {
 	Path      string
 	Workspace string
@@ -20,8 +22,13 @@ type archiveData struct {
 	Config    *ContainerConfig
 }
 
+// tarExtractXattrFlags keeps overlayfs whiteouts / opaque markers intact
+// when we extract container state from a .kiwi archive. Without these flags
+// `trusted.overlay.*` xattrs are dropped and deleted files resurface.
+var tarExtractXattrFlags = []string{"--xattrs", "--xattrs-include=*"}
+
 func extractArchiveEntries(archivePath, workspace string, entries ...string) error {
-	args := []string{"-xzf", archivePath, "-C", workspace}
+	args := append([]string{"-xzf", archivePath, "-C", workspace, "--occurrence=1"}, tarExtractXattrFlags...)
 	args = append(args, entries...)
 	return runCommand("tar", args...)
 }
@@ -40,7 +47,9 @@ func extractArchiveEntryToPath(archivePath, destination, entry string) error {
 	if tempFilePath != destination {
 		_ = os.RemoveAll(tempFilePath)
 	}
-	if err := runCommand("tar", "-xzf", archivePath, "-C", parent, entry); err != nil {
+	args := append([]string{"-xzf", archivePath, "-C", parent, "--occurrence=1"}, tarExtractXattrFlags...)
+	args = append(args, entry)
+	if err := runCommand("tar", args...); err != nil {
 		return err
 	}
 	if entry == base {
@@ -52,37 +61,67 @@ func extractArchiveEntryToPath(archivePath, destination, entry string) error {
 	return os.Rename(tempFilePath, destination)
 }
 
-// peekArchiveImageName reads only the meta.json header from a .kiwi archive to get
-// the image name and kind, without extracting any files. Returns instantly.
-func peekArchiveImageName(archivePath string) (string, string, error) {
+// readArchiveSmallEntries reads a set of small-file entries (meta.json,
+// manifest.json, config.json) from a .kiwi tarball in a single gzip pass,
+// stopping as soon as every requested entry has been found. This replaces
+// calling `tar -xzf` once per entry, which forced a full gzip decode of the
+// whole (GB-scale) archive just to locate a few hundred bytes.
+func readArchiveSmallEntries(archivePath string, wanted map[string]bool) (map[string][]byte, error) {
 	f, err := os.Open(archivePath)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	defer f.Close()
-
-	tr := tar.NewReader(f)
-	for {
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	remaining := len(wanted)
+	result := make(map[string][]byte, remaining)
+	for remaining > 0 {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return "", "", err
+			return nil, err
 		}
-		if strings.TrimPrefix(hdr.Name, "./") == "meta.json" {
-			var meta archiveEnvelope
-			if err := json.NewDecoder(tr).Decode(&meta); err != nil {
-				return "", "", err
-			}
-			imageName := meta.ImageName
-			if imageName == "" {
-				imageName = meta.Container
-			}
-			return imageName, meta.Kind, nil
+		name := strings.TrimPrefix(hdr.Name, "./")
+		if !wanted[name] {
+			continue
 		}
+		buf, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, err
+		}
+		result[name] = buf
+		remaining--
 	}
-	return "", "", fmt.Errorf("meta.json not found in archive")
+	return result, nil
+}
+
+// peekArchiveImageName reads only the meta.json header from a .kiwi archive to get
+// the image name and kind, without extracting any files. Returns instantly.
+func peekArchiveImageName(archivePath string) (string, string, error) {
+	entries, err := readArchiveSmallEntries(archivePath, map[string]bool{"meta.json": true})
+	if err != nil {
+		return "", "", err
+	}
+	raw, ok := entries["meta.json"]
+	if !ok {
+		return "", "", fmt.Errorf("meta.json not found in archive")
+	}
+	var meta archiveEnvelope
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return "", "", err
+	}
+	imageName := meta.ImageName
+	if imageName == "" {
+		imageName = meta.Container
+	}
+	return imageName, meta.Kind, nil
 }
 
 func loadArchiveMetadata(archivePath string) (archiveData, func(), error) {
@@ -93,24 +132,32 @@ func loadArchiveMetadata(archivePath string) (archiveData, func(), error) {
 	cleanup := func() {
 		_ = os.RemoveAll(workspace)
 	}
-	if err := extractArchiveEntries(archivePath, workspace, "meta.json", "manifest.json"); err != nil {
-		cleanup()
-		return archiveData{}, nil, err
-	}
-	metaData, err := os.ReadFile(filepath.Join(workspace, "meta.json"))
+	// Single gzip pass: read meta, manifest, and (optionally) config in one
+	// sweep. Stops as soon as all three headers have been seen, so we never
+	// decompress the GB-sized rootfs / state payload just to parse JSON.
+	entries, err := readArchiveSmallEntries(archivePath, map[string]bool{
+		"meta.json":     true,
+		"manifest.json": true,
+		"config.json":   true,
+	})
 	if err != nil {
 		cleanup()
 		return archiveData{}, nil, err
+	}
+	metaData, ok := entries["meta.json"]
+	if !ok {
+		cleanup()
+		return archiveData{}, nil, fmt.Errorf("meta.json not found in archive")
 	}
 	var meta archiveEnvelope
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		cleanup()
 		return archiveData{}, nil, err
 	}
-	manifestData, err := os.ReadFile(filepath.Join(workspace, "manifest.json"))
-	if err != nil {
+	manifestData, ok := entries["manifest.json"]
+	if !ok {
 		cleanup()
-		return archiveData{}, nil, err
+		return archiveData{}, nil, fmt.Errorf("manifest.json not found in archive")
 	}
 	var manifest ImageManifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
@@ -124,14 +171,10 @@ func loadArchiveMetadata(archivePath string) (archiveData, func(), error) {
 		Manifest:  manifest,
 	}
 	if meta.Kind == "container" {
-		if err := extractArchiveEntries(archivePath, workspace, "config.json"); err != nil {
+		configData, ok := entries["config.json"]
+		if !ok {
 			cleanup()
-			return archiveData{}, nil, err
-		}
-		configData, err := os.ReadFile(filepath.Join(workspace, "config.json"))
-		if err != nil {
-			cleanup()
-			return archiveData{}, nil, err
+			return archiveData{}, nil, fmt.Errorf("config.json not found in archive")
 		}
 		var config ContainerConfig
 		if err := json.Unmarshal(configData, &config); err != nil {
@@ -189,6 +232,76 @@ func sameArchiveImageIdentity(a, b ImageManifest) bool {
 		a.CreatedAt.Equal(b.CreatedAt)
 }
 
+// saveKiwiSquashfs builds a mountable, self-contained `.kiwi` file at
+// destination. The output is a zstd-compressed squashfs image containing:
+//
+//	meta.json        — archive envelope (kind, image name, source container)
+//	manifest.json    — base image manifest
+//	config.json      — container config (for container snapshots)
+//	rootfs/          — base image rootfs (hardlinked from the live store)
+//	state/upper/     — writable layer with installed packages / config (for
+//	                    container snapshots)
+//
+// The squashfs is mounted read-only at create/attach time, so no extraction
+// ever runs: the kernel pages blocks in on demand. Copying this file to any
+// host with kiwi installed yields instant container creation.
+func (s Store) saveKiwiSquashfs(meta archiveEnvelope, manifest ImageManifest, config *ContainerConfig, destination string) error {
+	if manifest.RootfsPath == "" {
+		return fmt.Errorf("cannot snapshot image %q: rootfs path missing", manifest.Name)
+	}
+	if !isDirectoryPath(manifest.RootfsPath) {
+		return fmt.Errorf("cannot snapshot image %q: rootfs backend is not a directory (run the container once to migrate)", manifest.Name)
+	}
+	staging, err := os.MkdirTemp(filepath.Dir(destination), "kiwi-stage-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+
+	metaBytes, err := writeJSONBytes(meta)
+	if err != nil {
+		return err
+	}
+	manifestBytes, err := writeJSONBytes(manifest)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(staging, "meta.json"), metaBytes, 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(staging, "manifest.json"), manifestBytes, 0644); err != nil {
+		return err
+	}
+	if config != nil {
+		configBytes, err := writeJSONBytes(config)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(staging, "config.json"), configBytes, 0644); err != nil {
+			return err
+		}
+	}
+	// Hardlink-mirror both layers into the staging tree. On a same-filesystem
+	// store this is O(inodes) — multi-GB layers are prepared in ~1 second.
+	rootfsStage := filepath.Join(staging, "rootfs")
+	if err := hardlinkTreePath(manifest.RootfsPath, rootfsStage); err != nil {
+		return fmt.Errorf("stage rootfs: %w", err)
+	}
+	if config != nil && isDirectoryPath(config.StatePath) {
+		upperSrc := filepath.Join(config.StatePath, "upper")
+		if pathExists(upperSrc) {
+			upperStage := filepath.Join(staging, "state", "upper")
+			if err := hardlinkTreePath(upperSrc, upperStage); err != nil {
+				return fmt.Errorf("stage upper layer: %w", err)
+			}
+		}
+	}
+	if err := packSquashfs(staging, destination); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s Store) saveArchive(meta archiveEnvelope, manifest ImageManifest, config *ContainerConfig, destination string) error {
 	workspace, err := os.MkdirTemp("", "kiwi-archive-")
 	if err != nil {
@@ -221,11 +334,14 @@ func (s Store) saveArchive(meta archiveEnvelope, manifest ImageManifest, config 
 	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
 		return err
 	}
-	command := []string{"--sparse", "-czf", destination, "-C", workspace, "meta.json", "manifest.json"}
+	command := []string{"--sparse", "--xattrs", "--xattrs-include=*", "-czf", destination, "-C", workspace, "meta.json", "manifest.json"}
 	if config != nil {
 		command = append(command, "config.json")
 	}
-	if meta.Kind == "image" {
+	// Always include the base rootfs so a .kiwi file is fully self-contained:
+	// moving it to another machine (with just kiwi installed) must suffice to
+	// recreate a working container without a separate `kiwi pull`.
+	if manifest.RootfsPath != "" {
 		rootfsName := "rootfs"
 		if !isDirectoryPath(manifest.RootfsPath) {
 			rootfsName = "rootfs.squashfs"
@@ -274,11 +390,8 @@ func (s Store) importArchiveImage(data archiveData, imageName string) (ImageMani
 	if err := os.MkdirAll(s.ImageDir(manifest.Name), 0755); err != nil {
 		return ImageManifest{}, err
 	}
-	// Try instant rename first, fallback to copy if on different filesystem
-	if err := os.Rename(data.Manifest.RootfsPath, manifest.RootfsPath); err != nil {
-		if err := copyPath(data.Manifest.RootfsPath, manifest.RootfsPath); err != nil {
-			return ImageManifest{}, err
-		}
+	if err := copyPath(data.Manifest.RootfsPath, manifest.RootfsPath); err != nil {
+		return ImageManifest{}, err
 	}
 	if err := s.SaveImage(manifest); err != nil {
 		return ImageManifest{}, err
@@ -334,11 +447,15 @@ func (s Store) ensureImageFromArchive(data archiveData) (ImageManifest, error) {
 }
 
 func (s Store) CreateContainerFromArchive(archivePath string, sizeBytes int64, explicitSize bool) (ContainerConfig, error) {
-	// Fast path: peek at image name without full extraction
+	if isSquashfsFile(archivePath) {
+		return s.createFromSquashfs(archivePath, sizeBytes, explicitSize)
+	}
+
+	// Legacy tar.gz path — kept for backward compatibility with snapshots
+	// produced by earlier kiwi versions.
 	if imageName, kind, err := peekArchiveImageName(archivePath); err == nil && kind == "image" {
 		if existing, err := s.LoadImage(imageName); err == nil {
 			if sameArchiveImageIdentity(existing, ImageManifest{Name: imageName}) {
-				// Image already cached, skip tar extraction entirely
 				return s.NewContainer(existing.Name, "", sizeBytes)
 			}
 		}
@@ -391,6 +508,126 @@ func (s Store) CreateContainerFromArchive(archivePath string, sizeBytes int64, e
 	}
 }
 
+// createFromSquashfs creates a container from a self-contained squashfs
+// `.kiwi` image. It never extracts anything: the image is mounted read-only
+// at a stable path inside kiwi-data, and the container's overlay stack
+// references that mount directly. Create and attach are both instant.
+func (s Store) createFromSquashfs(archivePath string, sizeBytes int64, explicitSize bool) (ContainerConfig, error) {
+	if err := s.EnsureLayout(); err != nil {
+		return ContainerConfig{}, err
+	}
+	mountPoint, meta, manifest, containerConfig, err := s.ensureKiwiImageMounted(archivePath)
+	if err != nil {
+		return ContainerConfig{}, err
+	}
+	containerName, err := s.NextContainerName()
+	if err != nil {
+		return ContainerConfig{}, err
+	}
+	ip, err := s.NextIP()
+	if err != nil {
+		return ContainerConfig{}, err
+	}
+	if err := os.MkdirAll(s.ContainerDir(containerName), 0755); err != nil {
+		return ContainerConfig{}, err
+	}
+	statePath := s.ContainerStatePath(containerName)
+	if err := os.MkdirAll(statePath, 0755); err != nil {
+		return ContainerConfig{}, err
+	}
+
+	imageName := sanitizeName(manifest.Name)
+	if imageName == "" {
+		imageName = "kiwi-archive"
+	}
+
+	targetSize := sizeBytes
+	if targetSize == 0 {
+		if containerConfig != nil && containerConfig.StateSizeBytes > 0 {
+			targetSize = containerConfig.StateSizeBytes
+		} else {
+			targetSize = defaultStateSize
+		}
+	}
+	if explicitSize {
+		targetSize = alignSize(sizeBytes, 1024*1024)
+	}
+
+	for _, dir := range []string{"upper", "work"} {
+		if err := ensureDir(filepath.Join(statePath, dir)); err != nil {
+			return ContainerConfig{}, err
+		}
+	}
+
+	var config ContainerConfig
+	if containerConfig != nil {
+		config = *containerConfig
+	}
+	config.Name = containerName
+	config.Hostname = containerName
+	config.Image = imageName
+	config.StatePath = statePath
+	config.StateBackend = "dir"
+	config.StateSizeBytes = targetSize
+	config.LazyStateArchive = archivePath
+	config.IPv4 = ip
+	config.Gateway = defaultGateway
+	config.CreatedAt = time.Now().UTC()
+	defaultContainerConfigValues(&config)
+	if err := s.SaveContainer(config); err != nil {
+		return ContainerConfig{}, err
+	}
+	maybeChownPaths(
+		s.ContainerDir(containerName),
+		s.ContainerConfigPath(containerName),
+		s.ContainerSnapshotsDir(containerName),
+		s.ContainerSessionsDir(containerName),
+	)
+	_ = meta
+	_ = mountPoint
+	return config, nil
+}
+
+// ensureKiwiImageMounted mounts a .kiwi squashfs (if not already mounted)
+// and returns its mountpoint plus decoded metadata. The mountpoint is
+// content-addressed (keyed by the archive's path/size/mtime) so repeated
+// calls share a single mount across all containers that use the same image.
+func (s Store) ensureKiwiImageMounted(archivePath string) (string, archiveEnvelope, ImageManifest, *ContainerConfig, error) {
+	mountPoint, err := ensureKiwiMountPath(archivePath)
+	if err != nil {
+		return "", archiveEnvelope{}, ImageManifest{}, nil, fmt.Errorf("mount .kiwi image: %w", err)
+	}
+	var meta archiveEnvelope
+	metaBytes, err := os.ReadFile(filepath.Join(mountPoint, "meta.json"))
+	if err != nil {
+		return "", archiveEnvelope{}, ImageManifest{}, nil, fmt.Errorf("read meta.json: %w", err)
+	}
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return "", archiveEnvelope{}, ImageManifest{}, nil, err
+	}
+	var manifest ImageManifest
+	manifestBytes, err := os.ReadFile(filepath.Join(mountPoint, "manifest.json"))
+	if err != nil {
+		return "", archiveEnvelope{}, ImageManifest{}, nil, fmt.Errorf("read manifest.json: %w", err)
+	}
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return "", archiveEnvelope{}, ImageManifest{}, nil, err
+	}
+	var config *ContainerConfig
+	if meta.Kind == "container" {
+		cfgBytes, err := os.ReadFile(filepath.Join(mountPoint, "config.json"))
+		if err != nil {
+			return "", archiveEnvelope{}, ImageManifest{}, nil, fmt.Errorf("read config.json: %w", err)
+		}
+		var parsed ContainerConfig
+		if err := json.Unmarshal(cfgBytes, &parsed); err != nil {
+			return "", archiveEnvelope{}, ImageManifest{}, nil, err
+		}
+		config = &parsed
+	}
+	return mountPoint, meta, manifest, config, nil
+}
+
 func (s Store) restoreArchivedContainer(template ContainerConfig, imageName, archivePath string, sizeBytes int64, validateDirStateMinimum bool) (ContainerConfig, error) {
 	if err := s.EnsureLayout(); err != nil {
 		return ContainerConfig{}, err
@@ -412,7 +649,6 @@ func (s Store) restoreArchivedContainer(template ContainerConfig, imageName, arc
 		stateEntry = "state.img"
 	}
 
-	// INSTANT CREATE: Just create empty state structure, no I/O!
 	if err := os.MkdirAll(statePath, 0755); err != nil {
 		return ContainerConfig{}, err
 	}
@@ -422,8 +658,6 @@ func (s Store) restoreArchivedContainer(template ContainerConfig, imageName, arc
 		}
 	}
 
-	// PRE-CACHE: Extract archive state to cache NOW (during create)
-	// This makes subsequent "attach" instant!
 	resolvedPath := archivePath
 	if !pathExists(resolvedPath) {
 		absPath, _ := filepath.Abs(resolvedPath)
@@ -431,10 +665,14 @@ func (s Store) restoreArchivedContainer(template ContainerConfig, imageName, arc
 			resolvedPath = absPath
 		}
 	}
-	if pathExists(resolvedPath) {
-		if _, cacheErr := getCachedArchiveState(resolvedPath, s.DataRoot); cacheErr != nil {
-			fmt.Fprintf(os.Stderr, "kiwi: warning: failed to pre-cache archive: %v\n", cacheErr)
-		}
+
+	// Force the archive state into the persistent layer cache so subsequent
+	// attaches are instant. On the host where the snapshot was created this
+	// cache is already pre-warmed via hardlinks (see SnapshotContainer), so
+	// this call returns immediately. On an imported .kiwi file we pay the
+	// extraction cost exactly once, here at create time.
+	if _, err := getCachedArchiveState(resolvedPath, s.DataRoot); err != nil {
+		return ContainerConfig{}, fmt.Errorf("prepare snapshot layer: %w", err)
 	}
 
 	if stateEntry == "state.img" {

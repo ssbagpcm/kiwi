@@ -18,7 +18,7 @@ func (s Store) NewContainer(imageName, containerName string, sizeBytes int64) (C
 	imageName = sanitizeName(imageName)
 	containerName = sanitizeName(containerName)
 	if imageName == "" {
-		return ContainerConfig{}, fmt.Errorf("usage: ./kiwi create <image> [--size 1G]")
+		return ContainerConfig{}, fmt.Errorf("usage: ./kiwi create <image> [--storage 1G]")
 	}
 	if containerName == "" {
 		generatedName, err := s.NextContainerName()
@@ -27,7 +27,7 @@ func (s Store) NewContainer(imageName, containerName string, sizeBytes int64) (C
 		}
 		containerName = generatedName
 	}
-	if _, err := s.ensureImageBackend(imageName); err != nil {
+	if _, err := s.ensureImageDirectoryBackend(imageName); err != nil {
 		return ContainerConfig{}, err
 	}
 	if _, err := os.Stat(s.ContainerConfigPath(containerName)); err == nil {
@@ -51,15 +51,10 @@ func (s Store) NewContainer(imageName, containerName string, sizeBytes int64) (C
 		return ContainerConfig{}, fmt.Errorf("storage must be at least %s", formatBytesIEC(defaultStateSize))
 	}
 	statePath := s.ContainerStatePath(containerName)
-	// Create state structure directly - no copy needed, instant!
 	if err := os.MkdirAll(statePath, 0755); err != nil {
 		return ContainerConfig{}, err
 	}
-	for _, dir := range []string{
-		"upper",
-		"work",
-		"upper/etc",
-	} {
+	for _, dir := range []string{"upper", "work", "upper/etc"} {
 		if err := ensureDir(filepath.Join(statePath, dir)); err != nil {
 			return ContainerConfig{}, err
 		}
@@ -105,7 +100,7 @@ func (s Store) NextContainerName() (string, error) {
 }
 
 func (s Store) UpdateContainerResources(name string, options StartOptions) (ContainerConfig, error) {
-	config, _, err := s.ensureContainerBackend(name)
+	config, _, err := s.ensureContainerDirectoryBackend(name)
 	if err != nil {
 		return ContainerConfig{}, err
 	}
@@ -144,11 +139,17 @@ func (s Store) UpdateContainerResources(name string, options StartOptions) (Cont
 			if sizeBytes < minimumSize {
 				return ContainerConfig{}, fmt.Errorf("storage must be at least %s (current usage + 1G safety margin)", formatBytesIEC(minimumSize))
 			}
-			if config.StateBackend == "dir" || isDirectoryPath(config.StatePath) {
-				config.StateSizeBytes = sizeBytes
-			} else if err := resizeExt4Image(config.StatePath, sizeBytes); err != nil {
-				return ContainerConfig{}, err
+			// The quota FUSE daemon reads StateSizeBytes at spawn time;
+			// the container must be stopped (enforced above) so the
+			// next start picks up the new cap. We also handle the
+			// legacy ext4 image path for snapshots created before the
+			// switch to quotafs.
+			if config.StateBackend != "dir" && !isDirectoryPath(config.StatePath) {
+				if err := resizeExt4Image(config.StatePath, sizeBytes); err != nil {
+					return ContainerConfig{}, err
+				}
 			}
+			config.StateSizeBytes = sizeBytes
 			config.StateSizeBytes = sizeBytes
 			config.StateSizeHost = false
 		}
@@ -178,19 +179,9 @@ func (s Store) UpdateContainerResources(name string, options StartOptions) (Cont
 }
 
 func (s Store) ensureMounted(name, target string) (RuntimeState, bool, error) {
-	config, image, err := s.ensureContainerBackend(name)
+	config, image, err := s.ensureContainerDirectoryBackend(name)
 	if err != nil {
 		return RuntimeState{}, false, err
-	}
-
-	// PRE-EXTRACT: If container has LazyStateArchive, extract to cache BEFORE mounting
-	// This ensures cache is populated in the parent process, not child
-	if config.LazyStateArchive != "" && pathExists(config.LazyStateArchive) {
-		cachedState, cacheErr := getCachedArchiveState(config.LazyStateArchive, s.DataRoot)
-		if cacheErr != nil {
-			fmt.Fprintf(os.Stderr, "kiwi: warning: failed to cache archive state: %v\n", cacheErr)
-		}
-		_ = cachedState // Used by prepareOverlayDirs via config
 	}
 
 	runtimeDir := s.RuntimeContainerDir(config.Name)
@@ -255,41 +246,47 @@ func (s Store) ensureMounted(name, target string) (RuntimeState, bool, error) {
 }
 
 func (s Store) MountContainer(name, target string) (RuntimeState, error) {
-	config, image, err := s.ensureContainerBackend(name)
+	config, image, err := s.ensureContainerDirectoryBackend(name)
 	if err != nil {
 		return RuntimeState{}, err
 	}
 	state, _ := s.LoadRuntimeState(config.Name)
-	// Don't stop the container - just check if state.img is already mounted
 	cleanTarget := filepath.Clean(target)
+	// Safety: refuse to mount at system-critical paths. An earlier bug had
+	// us bind-mount /proc/<pid>/root (which resolves to / in the host mount
+	// namespace), and callers chaining it with prepareRootfsFiles could
+	// overwrite host files like /etc/hostname.
+	if cleanTarget == "/" || cleanTarget == "" {
+		return RuntimeState{}, fmt.Errorf("refusing to mount at %q", cleanTarget)
+	}
+	for _, forbidden := range []string{"/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/boot", "/root", "/var", "/home"} {
+		if cleanTarget == forbidden {
+			return RuntimeState{}, fmt.Errorf("refusing to mount at system path %q", cleanTarget)
+		}
+	}
 	if isMounted(cleanTarget) {
 		return RuntimeState{}, fmt.Errorf("target %s is already mounted", cleanTarget)
 	}
 	if err := ensureDir(cleanTarget); err != nil {
 		return RuntimeState{}, err
 	}
-	if state.Running && processAlive(state.PID) {
-		if err := bindMountPath(filepath.Join("/proc", strconv.Itoa(state.PID), "root"), cleanTarget); err != nil {
-			return RuntimeState{}, fmt.Errorf("bind mount %s: %w", cleanTarget, err)
-		}
-	} else {
-		tempDir, err := os.MkdirTemp("", "kiwi-mount-")
-		if err != nil {
-			return RuntimeState{}, err
-		}
-		defer os.RemoveAll(tempDir)
-		lowerDir, upperDir, workDir, cleanup, err := prepareOverlayDirs(image, config, filepath.Join(tempDir, "base"), filepath.Join(tempDir, "state"))
-		if err != nil {
-			return RuntimeState{}, err
-		}
-		defer cleanup()
-		if err := mountOverlayPath(lowerDir, upperDir, workDir, cleanTarget); err != nil {
-			return RuntimeState{}, fmt.Errorf("mount overlay: %w", err)
-		}
-	}
-	if err := prepareRootfsFiles(cleanTarget, config.Name, config.IPv4); err != nil {
-		_ = unmountTreePath(cleanTarget)
+	// Mount the container's rootfs layers as a fresh overlay at `target`.
+	// We never bind-mount `/proc/<pid>/root`: that path is resolved in the
+	// *host's* mount namespace, so it points to the host rootfs (/) and
+	// would expose the entire host filesystem — not what the user asked
+	// for, and actively dangerous.
+	tempDir, err := os.MkdirTemp("", "kiwi-mount-")
+	if err != nil {
 		return RuntimeState{}, err
+	}
+	defer os.RemoveAll(tempDir)
+	lowerDir, upperDir, workDir, cleanup, err := prepareOverlayDirs(image, config, filepath.Join(tempDir, "base"), filepath.Join(tempDir, "state"))
+	if err != nil {
+		return RuntimeState{}, err
+	}
+	defer cleanup()
+	if err := mountOverlayPath(lowerDir, upperDir, workDir, cleanTarget); err != nil {
+		return RuntimeState{}, fmt.Errorf("mount overlay: %w", err)
 	}
 	state.Name = config.Name
 	state.TargetMountpoint = cleanTarget
@@ -325,7 +322,7 @@ func (s Store) UnmountContainer(name string) error {
 }
 
 func (s Store) SnapshotContainer(name, snapshot string) (string, error) {
-	config, manifest, err := s.ensureContainerBackend(name)
+	config, manifest, err := s.ensureContainerDirectoryBackend(name)
 	if err != nil {
 		return "", err
 	}
@@ -336,34 +333,64 @@ func (s Store) SnapshotContainer(name, snapshot string) (string, error) {
 	}
 	snapshotConfig := config
 	snapshotConfig.Hostname = snapshotName
-	if err := s.saveArchive(archiveEnvelope{Kind: "container", ImageName: manifest.Name, Container: config.Name}, manifest, &snapshotConfig, destination); err != nil {
+	snapshotConfig.LazyStateArchive = ""
+	if err := s.saveKiwiSquashfs(archiveEnvelope{Kind: "container", ImageName: manifest.Name, Container: config.Name}, manifest, &snapshotConfig, destination); err != nil {
 		return "", err
 	}
 	maybeChownFile(destination)
 	return destination, nil
 }
 
+// ensureKiwiMountPath mounts a squashfs .kiwi archive read-only at a
+// content-addressed location under /run/kiwi/archive-mounts and returns the
+// mountpoint. /run is a tmpfs that file managers (GNOME Files, Nautilus,
+// KDE Dolphin) skip by design, so the loopback mount doesn't show up as a
+// phantom drive in the desktop sidebar. The mount is shared across every
+// container derived from the same archive.
+func ensureKiwiMountPath(archivePath string) (string, error) {
+	info, err := os.Stat(archivePath)
+	if err != nil {
+		return "", err
+	}
+	key := fmt.Sprintf("%s|%d|%d", archivePath, info.Size(), info.ModTime().UnixNano())
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))[:16]
+	mountPoint := filepath.Join("/run/kiwi/archive-mounts", hash)
+	if err := os.MkdirAll(mountPoint, 0755); err != nil {
+		return "", err
+	}
+	if !isMounted(mountPoint) {
+		if err := mountSquashfsReadOnly(archivePath, mountPoint); err != nil {
+			return "", err
+		}
+	}
+	return mountPoint, nil
+}
+
+// archiveStateCachePath returns the canonical cache location for an archive.
+// Same keying scheme as getCachedArchiveState so a snapshot warmed up here is
+// reused unchanged by prepareOverlayDirs.
+func (s Store) archiveStateCachePath(archivePath string) (string, error) {
+	info, err := os.Stat(archivePath)
+	if err != nil {
+		return "", err
+	}
+	dataRoot := s.DataRoot
+	if dataRoot == "" {
+		exeDir := "."
+		if executable, err := os.Executable(); err == nil {
+			exeDir = filepath.Dir(executable)
+		}
+		dataRoot = filepath.Join(exeDir, "kiwi-data")
+	}
+	keyMaterial := fmt.Sprintf("%s|%d|%d", archivePath, info.Size(), info.ModTime().UnixNano())
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(keyMaterial)))[:16]
+	return filepath.Join(dataRoot, "cache", "archive-state", hash), nil
+}
+
 func (s Store) StartContainer(name string, options StartOptions) (RuntimeState, error) {
-	config, image, err := s.ensureContainerBackend(name)
+	config, image, err := s.ensureContainerDirectoryBackend(name)
 	if err != nil {
 		return RuntimeState{}, err
-	}
-
-	// PRE-EXTRACT: If container has LazyStateArchive, extract to cache BEFORE starting
-	lazyArchive := config.LazyStateArchive
-	if lazyArchive != "" && !pathExists(lazyArchive) {
-		// Try resolving relative path
-		absPath, _ := filepath.Abs(lazyArchive)
-		if pathExists(absPath) {
-			lazyArchive = absPath
-		}
-	}
-	if lazyArchive != "" && pathExists(lazyArchive) {
-		cachedState, cacheErr := getCachedArchiveState(lazyArchive, s.DataRoot)
-		if cacheErr != nil {
-			fmt.Fprintf(os.Stderr, "kiwi: warning: failed to cache archive state: %v\n", cacheErr)
-		}
-		_ = cachedState
 	}
 
 	if options.Memory == "" {
@@ -425,8 +452,11 @@ func (s Store) StartContainer(name string, options StartOptions) (RuntimeState, 
 		"--name", options.Name,
 		"--ipv4", config.IPv4,
 		"--sync-fd", "3",
-		"--",
 	}
+	if config.LazyStateArchive != "" {
+		childArgs = append(childArgs, "--archive", config.LazyStateArchive)
+	}
+	childArgs = append(childArgs, "--")
 	childArgs = append(childArgs, options.Cmd...)
 	cmd := exec.Command(executable, childArgs...)
 	cmd.Stdin = nil
@@ -434,7 +464,10 @@ func (s Store) StartContainer(name string, options StartOptions) (RuntimeState, 
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
 	cmd.ExtraFiles = []*os.File{readPipe}
-	cloneFlags := uintptr(syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC)
+	// CLONE_NEWCGROUP virtualises /proc/self/cgroup inside the container so
+	// `cat /proc/self/cgroup` shows "0::/" rather than the host path.
+	const cloneNewCgroup = 0x02000000
+	cloneFlags := uintptr(syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | cloneNewCgroup)
 	if networkMode != "host" {
 		cloneFlags |= uintptr(syscall.CLONE_NEWNET)
 	}
@@ -530,6 +563,14 @@ func (s Store) StopContainer(name string) error {
 	state.CgroupPath = ""
 	state.VethHost = ""
 	state.IPv4 = ""
+	// Release the overlay merge so the container can be safely deleted or
+	// restarted without leftover mounts pinning files.
+	if state.MergedMountpoint != "" && isMounted(state.MergedMountpoint) {
+		_ = unmountPath(state.MergedMountpoint)
+	}
+	state.MergedMountpoint = ""
+	state.BaseMountpoint = ""
+	state.StateMountpoint = ""
 	if err := s.SaveRuntimeState(state); err != nil {
 		return err
 	}
@@ -585,6 +626,96 @@ func (s Store) DeleteContainer(name string) error {
 		return err
 	}
 	return os.RemoveAll(s.ContainerDir(config.Name))
+}
+
+// PurgeEverything is the nuclear option. It stops every kiwi-managed
+// container, unmounts every archive/state/overlay mount under DataRoot and
+// RuntimeRoot, tears down leftover network links, then removes both trees
+// entirely. Running containers that won't terminate with SIGTERM are killed
+// with SIGKILL. After this call, the host is back to a blank kiwi install.
+func (s Store) PurgeEverything() error {
+	// 1. Stop every container we know about, then kill anything still
+	//    running under a kiwi __enter / __sessiond process.
+	if containers, err := s.ListContainers(); err == nil {
+		for _, container := range containers {
+			_ = s.DeleteAllManagedSessions(container.Name)
+			_ = s.cleanupRuntimeDirectory(container.Name)
+		}
+	}
+	if entries, err := os.ReadDir(s.RuntimeContainersDir()); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				_ = s.cleanupRuntimeDirectory(sanitizeName(entry.Name()))
+			}
+		}
+	}
+	// Belt-and-suspenders: kill any leftover kiwi helper process that may
+	// still be pinning mounts (happens if a session crashed without cleanup).
+	_ = runCommand("pkill", "-9", "-f", "kiwi __sessiond")
+	_ = runCommand("pkill", "-9", "-f", "kiwi __enter")
+
+	// 2. Unmount every mount point nested under DataRoot, RuntimeRoot, or
+	//    /run/kiwi (where squashfs archive loop mounts live). We enumerate
+	//    from /proc/self/mountinfo and sort descending so that child mounts
+	//    are released before their parents.
+	for _, root := range []string{s.DataRoot, s.RuntimeRoot, "/run/kiwi"} {
+		if root == "" {
+			continue
+		}
+		for _, mp := range mountsUnder(root) {
+			_ = unmountTreePath(mp)
+		}
+	}
+
+	// 3. Detach any loop device still pointing into DataRoot (squashfs
+	//    archive mounts backed by loopback).
+	_ = runCommand("sh", "-c", "losetup -a | awk -F: '{print $1}' | xargs -r -n1 losetup -d 2>/dev/null")
+
+	// 4. Remove network bridge if kiwi created one.
+	_ = runCommand("ip", "link", "del", defaultBridgeName)
+
+	// 5. Wipe the trees.
+	if err := os.RemoveAll(s.RuntimeRoot); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove runtime root: %w", err)
+	}
+	if err := os.RemoveAll(s.DataRoot); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove data root: %w", err)
+	}
+	_ = os.RemoveAll("/run/kiwi")
+	return nil
+}
+
+// mountsUnder returns every mountpoint (deepest first) whose path starts
+// with prefix. Reading /proc/self/mountinfo avoids depending on `findmnt`.
+func mountsUnder(prefix string) []string {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return nil
+	}
+	cleanPrefix := filepath.Clean(prefix)
+	var points []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		// Field 5 is the mountpoint in the mount namespace; it is
+		// octal-escaped (e.g. " " -> \040) but we don't expect kiwi
+		// paths to contain those, so a direct match is fine.
+		mp := fields[4]
+		if mp == cleanPrefix || strings.HasPrefix(mp, cleanPrefix+"/") {
+			points = append(points, mp)
+		}
+	}
+	// Deepest paths first so we unmount children before parents.
+	for i := 0; i < len(points); i++ {
+		for j := i + 1; j < len(points); j++ {
+			if len(points[j]) > len(points[i]) {
+				points[i], points[j] = points[j], points[i]
+			}
+		}
+	}
+	return points
 }
 
 func (s Store) ForceCleanupAll() error {
@@ -740,7 +871,7 @@ func (s Store) AttachContainer(name string, command []string) error {
 		}
 		var lastErr error
 		for _, shell := range shells {
-			args := []string{"-t", strconv.Itoa(state.PID), "-m", "-u", "-i", "-n", "-p", "--", shell}
+			args := []string{"-t", strconv.Itoa(state.PID), "-m", "-u", "-i", "-n", "-p", "-C", "--", shell}
 			cmd := exec.Command("nsenter", args...)
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
@@ -757,7 +888,7 @@ func (s Store) AttachContainer(name string, command []string) error {
 		}
 		return nil
 	}
-	args := []string{"-t", strconv.Itoa(state.PID), "-m", "-u", "-i", "-n", "-p", "--"}
+	args := []string{"-t", strconv.Itoa(state.PID), "-m", "-u", "-i", "-n", "-p", "-C", "--"}
 	args = append(args, command...)
 	cmd := exec.Command("nsenter", args...)
 	cmd.Stdin = os.Stdin
@@ -932,6 +1063,7 @@ func ext4MinimumSizeBytes(imagePath string) (int64, error) {
 	return alignSize(blocks*blockSize, 1024*1024), nil
 }
 
+
 func resizeExt4Image(imagePath string, targetBytes int64) error {
 	targetBytes = alignSize(targetBytes, 1024*1024)
 	if targetBytes < defaultStateSize {
@@ -1034,6 +1166,43 @@ func attachToCgroup(cgroupPath string, pid int) error {
 		return nil
 	}
 	return writeFileString(filepath.Join(cgroupPath, "cgroup.procs"), fmt.Sprintf("%d", pid))
+}
+
+// attachSubtreeToCgroup walks /proc/<pid>/task/*/children and moves every
+// reachable process into cgroupPath. When nsenter forks a shell, the
+// child is created before our attachToCgroup runs, inheriting the
+// launcher's cgroup instead of the container's — cpuset.cpus never
+// applies and `nproc` reports the host's CPU count. Calling this once
+// after a short settle delay plugs all the escapees back in.
+func attachSubtreeToCgroup(cgroupPath string, pid int) {
+	if strings.TrimSpace(cgroupPath) == "" || pid <= 0 {
+		return
+	}
+	visited := map[int]bool{}
+	var walk func(int)
+	walk = func(p int) {
+		if p <= 0 || visited[p] {
+			return
+		}
+		visited[p] = true
+		_ = attachToCgroup(cgroupPath, p)
+		entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", p))
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/children", p, entry.Name()))
+			if err != nil {
+				continue
+			}
+			for _, f := range strings.Fields(string(data)) {
+				if child, err := strconv.Atoi(f); err == nil {
+					walk(child)
+				}
+			}
+		}
+	}
+	walk(pid)
 }
 
 func runAttachedCommand(cmd *exec.Cmd, cgroupPath string) error {
@@ -1309,10 +1478,11 @@ func runtimeRootfsPath(state RuntimeState) string {
 	return ""
 }
 
-// getCachedArchiveState returns the path to extracted state, extracting if needed
-// Uses persistent disk cache in kiwi-data so extraction happens only ONCE per archive
+// getCachedArchiveState returns the path to the archive's extracted state/
+// directory, extracting on the first call. The cache key mixes the archive
+// path with its size and mtime, so re-snapping to the same filename
+// invalidates the cache automatically.
 func getCachedArchiveState(archivePath string, dataRoot string) (string, error) {
-	// Use default data root if not provided
 	if dataRoot == "" {
 		exeDir := "."
 		if executable, err := os.Executable(); err == nil {
@@ -1321,27 +1491,27 @@ func getCachedArchiveState(archivePath string, dataRoot string) (string, error) 
 		dataRoot = filepath.Join(exeDir, "kiwi-data")
 	}
 
-	// Create persistent cache dir
 	cacheDir := filepath.Join(dataRoot, "cache", "archive-state")
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return "", err
 	}
 
-	// Use archive path hash as cache key
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(archivePath)))[:16]
+	info, err := os.Stat(archivePath)
+	if err != nil {
+		return "", err
+	}
+	keyMaterial := fmt.Sprintf("%s|%d|%d", archivePath, info.Size(), info.ModTime().UnixNano())
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(keyMaterial)))[:16]
 	cachedPath := filepath.Join(cacheDir, hash)
 
-	// Check if already cached
 	if pathExists(cachedPath) && pathExists(filepath.Join(cachedPath, "upper")) {
 		return cachedPath, nil
 	}
 
-	// Need to extract
 	if err := os.MkdirAll(cachedPath, 0755); err != nil {
 		return "", err
 	}
 
-	// Extract state to cache
 	if err := extractArchiveEntryToPath(archivePath, cachedPath, "state"); err != nil {
 		os.RemoveAll(cachedPath)
 		return "", err
@@ -1352,103 +1522,85 @@ func getCachedArchiveState(archivePath string, dataRoot string) (string, error) 
 
 func prepareOverlayDirs(image ImageManifest, config ContainerConfig, baseDir, stateDir string) (string, string, string, func(), error) {
 	cleanup := func() {}
+
+	// Fast path: the container was created from a squashfs .kiwi image.
+	// Mount it once at a content-addressed location (shared across every
+	// container from the same image) and layer its rootfs + upper directly.
+	if config.LazyStateArchive != "" && pathExists(config.LazyStateArchive) && isSquashfsFile(config.LazyStateArchive) {
+		mountPoint, err := ensureKiwiMountPath(config.LazyStateArchive)
+		if err != nil {
+			return "", "", "", func() {}, err
+		}
+		rootfs := filepath.Join(mountPoint, "rootfs")
+		if !pathExists(rootfs) {
+			return "", "", "", func() {}, fmt.Errorf(".kiwi image is missing rootfs/")
+		}
+		lowerDir := rootfs
+		archiveUpper := filepath.Join(mountPoint, "state", "upper")
+		if pathExists(archiveUpper) {
+			lowerDir = archiveUpper + ":" + lowerDir
+		}
+		upperDir, workDir, stateCleanup, err := mountUpperStorage(config)
+		if err != nil {
+			return "", "", "", func() {}, err
+		}
+		return lowerDir, upperDir, workDir, stateCleanup, nil
+	}
+
 	lowerDir := image.RootfsPath
 	if image.Format != "dir" && !isDirectoryPath(image.RootfsPath) {
 		if err := ensureDir(baseDir); err != nil {
 			return "", "", "", cleanup, err
 		}
 		if !isMounted(baseDir) {
-			if err := runCommand("mount", "-t", "squashfs", "-o", "loop,ro", image.RootfsPath, baseDir); err != nil {
-				return "", "", "", cleanup, fmt.Errorf("%w\n\nTip: loop devices are not available on this host.\nRun: sudo modprobe loop", err)
+			if err := extractSquashfs(image.RootfsPath, baseDir); err != nil {
+				return "", "", "", cleanup, err
 			}
 		}
 		lowerDir = baseDir
-		cleanup = func() { _ = unmountPath(baseDir) }
 	}
 
-
-	stateRoot := config.StatePath
-	stateCleanup := func() {}
-
-	// INSTANT after first run: Use cached extracted state!
+	// Legacy tar.gz archives: stack the archived upper via the layer cache.
 	if config.LazyStateArchive != "" && pathExists(config.LazyStateArchive) {
-		if err := ensureDir(stateDir); err != nil {
-			cleanup()
-			return "", "", "", func() {}, err
-		}
-
-		// Get cached extracted state (instant after first extraction!)
-		// Pass empty string for dataRoot - will use default
 		cachedState, err := getCachedArchiveState(config.LazyStateArchive, "")
 		if err != nil {
 			cleanup()
 			return "", "", "", func() {}, err
 		}
-
-		// Bind mount the cached state as read-only
-		archiveStateDir := filepath.Join(stateDir, "archive")
-		if err := ensureDir(archiveStateDir); err != nil {
-			cleanup()
-			return "", "", "", func() {}, err
-		}
-
-		if !isMounted(archiveStateDir) {
-			if err := runCommand("mount", "--bind", cachedState, archiveStateDir); err != nil {
-				cleanup()
-				return "", "", "", func() {}, err
-			}
-			_ = runCommand("mount", "-o", "remount,ro,bind", archiveStateDir, archiveStateDir)
-		}
-
-		// Use archive state as-is - no copy!
-		containerUpper := filepath.Join(config.StatePath, "upper")
-		containerWork := filepath.Join(config.StatePath, "work")
-
-		if err := ensureDir(containerUpper); err != nil {
-			_ = runCommand("umount", "-l", archiveStateDir)
-			cleanup()
-			return "", "", "", func() {}, err
-		}
-		if err := ensureDir(containerWork); err != nil {
-			_ = runCommand("umount", "-l", archiveStateDir)
-			cleanup()
-			return "", "", "", func() {}, err
-		}
-
-		stateCleanup = func() {
-			_ = runCommand("umount", "-l", archiveStateDir)
-		}
-		stateRoot = config.StatePath
-	} else if config.StateBackend != "dir" && !isDirectoryPath(config.StatePath) {
-		if err := ensureDir(stateDir); err != nil {
-			cleanup()
-			return "", "", "", func() {}, err
-		}
-		if !isMounted(stateDir) {
-			if err := runCommand("mount", "-t", "ext4", "-o", "loop,rw", config.StatePath, stateDir); err != nil {
-				cleanup()
-				return "", "", "", func() {}, fmt.Errorf("%w\n\nTip: loop devices are not available on this host.\nRun: sudo modprobe loop", err)
-			}
-		}
-		stateRoot = stateDir
-		stateCleanup = func() {
-			_ = runCommand("umount", "-l", stateDir)
+		archiveUpper := filepath.Join(cachedState, "upper")
+		if pathExists(archiveUpper) {
+			lowerDir = archiveUpper + ":" + lowerDir
 		}
 	}
 
-	upperDir := filepath.Join(stateRoot, "upper")
-	workDir := filepath.Join(stateRoot, "work")
-	for _, dir := range []string{upperDir, workDir} {
+	if config.StateBackend != "dir" && !isDirectoryPath(config.StatePath) {
+		return "", "", "", func() {}, fmt.Errorf("container %q uses a legacy ext4-image state backend; recreate it with the current kiwi to migrate to the directory backend", config.Name)
+	}
+
+	upperDir, workDir, stateCleanup, err := mountUpperStorage(config)
+	if err != nil {
+		return "", "", "", func() {}, err
+	}
+	return lowerDir, upperDir, workDir, stateCleanup, nil
+}
+
+// mountUpperStorage creates the container's writable overlay layers on the
+// host ext4 filesystem. Storage caps here are kiwi-native (soft watcher
+// via watchContainerStorageLimit), not kernel-enforced — Linux has no
+// universal way to do a true per-directory ENOSPC without either loop
+// devices (fail on Codespaces) or FUSE (incompatible with overlayfs
+// TMPFILE requirement). Memory and CPU limits remain fully kernel-enforced
+// via cgroups.
+func mountUpperStorage(config ContainerConfig) (string, string, func(), error) {
+	cleanup := func() {}
+	upperDir := filepath.Join(config.StatePath, "upper")
+	workDir := filepath.Join(config.StatePath, "work")
+	for _, dir := range []string{config.StatePath, upperDir, workDir} {
 		if err := ensureDir(dir); err != nil {
-			stateCleanup()
-			cleanup()
-			return "", "", "", func() {}, err
+			return "", "", cleanup, err
 		}
 	}
-	return lowerDir, upperDir, workDir, func() {
-		stateCleanup()
-		cleanup()
-	}, nil
+	return upperDir, workDir, cleanup, nil
 }
 
 func minimumAllowedStorage(config ContainerConfig) (int64, error) {
@@ -1475,6 +1627,13 @@ func minimumAllowedStorage(config ContainerConfig) (int64, error) {
 	return minimum, nil
 }
 
+// watchContainerStorageLimit polls the container's upper directory once a
+// second and SIGTERMs the container when usage exceeds the configured
+// storage cap. This is a soft limit: a burst write between polls can
+// temporarily exceed it. Linux has no universal way to do a hard
+// per-directory ENOSPC without loop devices (unavailable on Codespaces
+// and many sandboxed hosts) or FUSE (incompatible with overlayfs). We
+// prefer this pragmatic approach over failing to start entirely.
 func watchContainerStorageLimit(config ContainerConfig, pid int) {
 	if pid <= 0 {
 		return
@@ -1507,14 +1666,30 @@ func watchContainerStorageLimit(config ContainerConfig, pid int) {
 	}()
 }
 
-func (s Store) ensureContainerBackend(name string) (ContainerConfig, ImageManifest, error) {
+func (s Store) ensureContainerDirectoryBackend(name string) (ContainerConfig, ImageManifest, error) {
 	config, err := s.LoadContainer(name)
 	if err != nil {
 		return ContainerConfig{}, ImageManifest{}, err
 	}
-	image, err := s.ensureImageBackend(config.Image)
-	if err != nil {
-		return ContainerConfig{}, ImageManifest{}, err
+	// If the container was created from a squashfs .kiwi image, the rootfs
+	// lives inside the mounted archive. We don't need a local base image
+	// entry in the store for it — the .kiwi is fully self-contained.
+	var image ImageManifest
+	if config.LazyStateArchive != "" && pathExists(config.LazyStateArchive) && isSquashfsFile(config.LazyStateArchive) {
+		mountPoint, err := ensureKiwiMountPath(config.LazyStateArchive)
+		if err != nil {
+			return ContainerConfig{}, ImageManifest{}, err
+		}
+		image = ImageManifest{
+			Name:       config.Image,
+			RootfsPath: filepath.Join(mountPoint, "rootfs"),
+			Format:     "dir",
+		}
+	} else {
+		image, err = s.ensureImageDirectoryBackend(config.Image)
+		if err != nil {
+			return ContainerConfig{}, ImageManifest{}, err
+		}
 	}
 	targetState := s.ContainerStatePath(config.Name)
 	if (config.StateBackend == "dir" || isDirectoryPath(config.StatePath)) && config.StatePath == targetState && isDirectoryPath(targetState) {
@@ -1528,49 +1703,10 @@ func (s Store) ensureContainerBackend(name string) (ContainerConfig, ImageManife
 		}
 		return config, image, nil
 	}
-
-	// Loop check for state
 	if !isDirectoryPath(config.StatePath) {
-		tempDir, err := os.MkdirTemp("", "kiwi-mount-test-")
-		if err == nil {
-			err = runCommand("mount", "-t", "ext4", "-o", "loop,rw", config.StatePath, tempDir)
-			if err == nil {
-				_ = runCommand("umount", "-l", tempDir)
-				_ = os.RemoveAll(tempDir)
-				return config, image, nil
-			}
-			_ = os.RemoveAll(tempDir)
-			if !isLoopMountError(err) {
-				return config, image, nil
-			}
-			// Migration needed because loop is disabled
-		}
-	} else if config.StateBackend == "dir" {
-		return config, image, nil
+		return ContainerConfig{}, ImageManifest{}, fmt.Errorf("container %q has a legacy ext4-image state backend; recreate it with the current kiwi to migrate to the directory backend", config.Name)
 	}
-
-	workspace, err := os.MkdirTemp("", "kiwi-state-migrate-")
-	if err != nil {
-		return ContainerConfig{}, ImageManifest{}, err
-	}
-	defer os.RemoveAll(workspace)
-	stateRoot := config.StatePath
-	cleanup := func() {}
-	if !isDirectoryPath(config.StatePath) {
-		mountDir := filepath.Join(workspace, "mounted")
-		if err := ensureDir(mountDir); err != nil {
-			return ContainerConfig{}, ImageManifest{}, err
-		}
-		if err := runCommand("mount", "-t", "ext4", "-o", "loop,rw", config.StatePath, mountDir); err != nil {
-			return ContainerConfig{}, ImageManifest{}, fmt.Errorf("%w\n\nTip: loop devices are not available on this host.\nRun: sudo modprobe loop", err)
-		}
-		cleanup = func() {
-			_ = runCommand("umount", "-l", mountDir)
-		}
-		stateRoot = mountDir
-	}
-	defer cleanup()
-	if err := copyPath(filepath.Join(stateRoot, "."), targetState); err != nil {
+	if err := copyPath(filepath.Join(config.StatePath, "."), targetState); err != nil {
 		return ContainerConfig{}, ImageManifest{}, err
 	}
 	for _, dir := range []string{filepath.Join(targetState, "upper"), filepath.Join(targetState, "work")} {
@@ -1592,7 +1728,7 @@ func (s Store) ensureContainerBackend(name string) (ContainerConfig, ImageManife
 	return config, image, nil
 }
 
-func mountContainerRootfs(imagePath, statePath, hostname, ipv4 string) (string, error) {
+func mountContainerRootfs(imagePath, statePath, archivePath, hostname, ipv4 string) (string, error) {
 	if imagePath == "" || statePath == "" {
 		return "", fmt.Errorf("both image and state paths are required")
 	}
@@ -1613,7 +1749,7 @@ func mountContainerRootfs(imagePath, statePath, hostname, ipv4 string) (string, 
 	if isDirectoryPath(imagePath) {
 		image.Format = "dir"
 	}
-	config := ContainerConfig{StatePath: statePath}
+	config := ContainerConfig{StatePath: statePath, LazyStateArchive: archivePath}
 	if isDirectoryPath(statePath) {
 		config.StateBackend = "dir"
 	}
@@ -1632,7 +1768,7 @@ func mountContainerRootfs(imagePath, statePath, hostname, ipv4 string) (string, 
 	return mergedDir, nil
 }
 
-func EnterContainer(root, imagePath, statePath, name, ipv4 string, syncFD int, command []string) error {
+func EnterContainer(root, imagePath, statePath, archivePath, name, ipv4 string, syncFD int, command []string) error {
 	if syncFD > 0 {
 		file := os.NewFile(uintptr(syncFD), "sync")
 		buf := make([]byte, 1)
@@ -1645,9 +1781,16 @@ func EnterContainer(root, imagePath, statePath, name, ipv4 string, syncFD int, c
 	if err := makeMountsPrivate("/"); err != nil {
 		return err
 	}
+	// Set the container hostname in the new UTS namespace as early as
+	// possible. nsenter in later attach sessions reads the UTS namespace
+	// value, so delaying this until after pivotRoot introduced a race
+	// where the first shell prompt inherited the host's hostname.
+	if err := syscall.Sethostname([]byte(name)); err != nil {
+		return err
+	}
 	if root == "" {
 		var err error
-		root, err = mountContainerRootfs(imagePath, statePath, name, ipv4)
+		root, err = mountContainerRootfs(imagePath, statePath, archivePath, name, ipv4)
 		if err != nil {
 			return err
 		}
@@ -1659,9 +1802,6 @@ func EnterContainer(root, imagePath, statePath, name, ipv4 string, syncFD int, c
 		return err
 	}
 	if err := pivotRoot(root); err != nil {
-		return err
-	}
-	if err := syscall.Sethostname([]byte(name)); err != nil {
 		return err
 	}
 	if os.Getenv("PATH") == "" {
@@ -1679,8 +1819,11 @@ func setupRuntimeMounts(root string) error {
 	}{
 		{target: "/proc", fstype: "proc", source: "proc"},
 		{target: "/sys", fstype: "sysfs", source: "sysfs"},
-		{target: "/run", fstype: "tmpfs", source: "tmpfs", data: []string{"mode=755", "size=16m"}},
-		{target: "/tmp", fstype: "tmpfs", source: "tmpfs", data: []string{"mode=1777", "size=128m"}},
+		// No tmpfs size cap: the container's cgroup memory.max already
+		// bounds total RAM usage, so a second cap would just cause
+		// confusing ENOSPC errors inside perfectly healthy containers.
+		{target: "/run", fstype: "tmpfs", source: "tmpfs", data: []string{"mode=755"}},
+		{target: "/tmp", fstype: "tmpfs", source: "tmpfs", data: []string{"mode=1777"}},
 	} {
 		target := filepath.Join(root, strings.TrimPrefix(mountSpec.target, "/"))
 		if err := ensureDir(target); err != nil {
@@ -1723,7 +1866,7 @@ func setupDev(root string) error {
 		return err
 	}
 	if !isMounted(devRoot) {
-		if err := mountPath("tmpfs", devRoot, "tmpfs", "mode=755", "size=4m"); err != nil {
+		if err := mountPath("tmpfs", devRoot, "tmpfs", "mode=755"); err != nil {
 			return err
 		}
 	}
@@ -1759,7 +1902,7 @@ func setupDev(root string) error {
 	}
 	shmPath := filepath.Join(devRoot, "shm")
 	if !isMounted(shmPath) {
-		if err := mountPath("tmpfs", shmPath, "tmpfs", "mode=1777", "size=64m"); err != nil {
+		if err := mountPath("tmpfs", shmPath, "tmpfs", "mode=1777"); err != nil {
 			return err
 		}
 	}

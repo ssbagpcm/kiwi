@@ -18,6 +18,7 @@ EOF
 mkdir -p "$DIST_DIR"
 cd "$ROOT_DIR"
 
+
 build_target() {
   local goarch="$1"
   local goarm="${2:-}"

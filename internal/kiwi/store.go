@@ -78,6 +78,13 @@ func (s Store) ContainerStatePath(name string) string {
 	return filepath.Join(s.ContainerDir(name), "state")
 }
 
+// ContainerStateImagePath is retained for backwards compatibility with
+// snapshots created while kiwi experimented with an ext4 loop backend.
+// New containers don't use this path.
+func (s Store) ContainerStateImagePath(name string) string {
+	return filepath.Join(s.ContainerDir(name), "state.img")
+}
+
 func (s Store) ContainerSnapshotsDir(name string) string {
 	return filepath.Join(s.ContainerDir(name), "snapshots")
 }

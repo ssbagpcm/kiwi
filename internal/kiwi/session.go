@@ -339,6 +339,7 @@ func (s *sessionServer) run() error {
 	}
 }
 
+
 func (s *sessionServer) handleConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadBytes('\n')
@@ -376,6 +377,16 @@ func (s *sessionServer) handleConnection(conn net.Conn) {
 		info.UpdatedAt = time.Now().UTC()
 	})
 	s.mu.Unlock()
+	// Reset any mouse-reporting / bracketed-paste modes the terminal may
+	// have inherited from a previous TUI (opencode, htop, vim…) that
+	// crashed or exited without cleaning up. Without this, stray mouse
+	// events from the user's terminal emulator keep arriving at the shell
+	// as literal escape sequences like `\e[<35;105;22M` and get echoed
+	// back verbatim. These DECRST codes are the canonical way to turn off
+	// mouse tracking variants (1000, 1002, 1003, 1005, 1006, 1015) and
+	// bracketed paste (2004).
+	const terminalReset = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l"
+	_, _ = conn.Write([]byte(terminalReset))
 	if tail, err := readTail(bufferPath, sessionBufferLimit); err == nil && len(tail) > 0 {
 		_, _ = conn.Write(tail)
 	}
@@ -404,6 +415,10 @@ func (s *sessionServer) handleConnection(conn net.Conn) {
 		info.UpdatedAt = time.Now().UTC()
 	})
 	s.mu.Unlock()
+	// Send a final reset so the user's terminal emulator isn't left in
+	// mouse-reporting / alt-screen mode if the shell exited from a TUI.
+	const detachReset = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?25h\x1b[?1049l"
+	_, _ = conn.Write([]byte(detachReset))
 	_ = conn.Close()
 }
 
@@ -427,7 +442,7 @@ func (s *sessionServer) ensureShell(handshake sessionHandshake) error {
 	shells := sessionShellCandidates(config.Shell)
 	var ptmx *os.File
 	var cmd *exec.Cmd
-	shellErr := fmt.Errorf("no shell found in container (tried %v)", shells)
+	var shellErr error
 	rootPath := runtimeRootfsPath(state)
 	if rootPath == "" {
 		return fmt.Errorf("container %q has no live rootfs", config.Name)
@@ -438,10 +453,10 @@ func (s *sessionServer) ensureShell(handshake sessionHandshake) error {
 			shellPath = "/" + shellPath
 		}
 		fullPath := filepath.Join(rootPath, strings.TrimPrefix(shellPath, "/"))
-		if _, err := os.Lstat(fullPath); err != nil {
+		if _, err := os.Stat(fullPath); err != nil {
 			continue
 		}
-		args := []string{"-t", strconv.Itoa(state.PID), "-m", "-u", "-i", "-n", "-p", "--", shellPath, "-i"}
+		args := []string{"-t", strconv.Itoa(state.PID), "-m", "-u", "-i", "-n", "-p", "-C", "--", shellPath, "-i"}
 		cmd = exec.Command("nsenter", args...)
 		cmd.Env = shellSessionEnv(shellPath, effectiveHostname(config))
 		ptmx, shellErr = pty.StartWithSize(cmd, &pty.Winsize{Rows: handshake.Rows, Cols: handshake.Cols})
@@ -452,14 +467,22 @@ func (s *sessionServer) ensureShell(handshake sessionHandshake) error {
 				shellErr = err
 				continue
 			}
+			// nsenter forks the shell before we can attach; walk the
+			// subtree after a short settle delay to pull any escapee
+			// shell into the container cgroup. Without this,
+			// cpuset.cpus and cpu.max only apply to nsenter itself
+			// and `nproc` inside the container reports host totals.
+			go func(pid int) {
+				for i := 0; i < 20; i++ {
+					timeSleepMillis(25)
+					attachSubtreeToCgroup(state.CgroupPath, pid)
+				}
+			}(cmd.Process.Pid)
 			break
 		}
 	}
-	if shellErr != nil || cmd == nil || cmd.Process == nil {
-		if shellErr == nil {
-			shellErr = fmt.Errorf("failed to start shell")
-		}
-		return shellErr
+	if shellErr != nil {
+		return fmt.Errorf("no shell found in container (tried %v): %w", shells, shellErr)
 	}
 	s.ptyFile = ptmx
 	s.shellCmd = cmd

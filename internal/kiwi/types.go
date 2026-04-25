@@ -36,14 +36,14 @@ type ContainerConfig struct {
 	StateBackend   string    `json:"state_backend,omitempty"`
 	// LazyStateArchive is the path to the archive for instant container restore
 	LazyStateArchive string    `json:"lazy_state_archive,omitempty"`
-	IPv4             string    `json:"ipv4"`
-	Gateway          string    `json:"gateway"`
-	Memory           string    `json:"-"`
-	CPU              int       `json:"-"`
-	CPUHost          bool      `json:"-"`
-	Network          string    `json:"-"`
-	Shell            string    `json:"-"`
-	CreatedAt        time.Time `json:"-"`
+	IPv4      string    `json:"ipv4"`
+	Gateway   string    `json:"gateway"`
+	Memory    string    `json:"-"`
+	CPU       int       `json:"-"`
+	CPUHost   bool      `json:"-"`
+	Network   string    `json:"-"`
+	Shell     string    `json:"-"`
+	CreatedAt time.Time `json:"-"`
 }
 
 type RuntimeState struct {
@@ -88,7 +88,7 @@ type StartOptions struct {
 
 type builtInImage struct {
 	Name        string
-	URL         string
+	URLs        map[string]string
 	Description string
 }
 

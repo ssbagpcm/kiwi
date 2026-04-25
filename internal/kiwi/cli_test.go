@@ -28,7 +28,7 @@ func TestGenerateSessionIDLength(t *testing.T) {
 }
 
 func TestParseCreateArgs(t *testing.T) {
-	parsed, err := parseCreateArgs([]string{"alpine", "--size", "2G"})
+	parsed, err := parseCreateArgs([]string{"alpine", "--storage", "2G"})
 	if err != nil {
 		t.Fatalf("parseCreateArgs() error = %v", err)
 	}
